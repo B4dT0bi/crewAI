@@ -18,10 +18,10 @@ class AgentTools(BaseAgentTools):
                 func=self.delegate_work,
                 name="Delegate work to coworker",
                 description=self.i18n.tools("delegate_work").format(
-                    coworkers=coworkers
+                  coworkers=coworkers
                 ),
             ),
-            StructuredTool.from_function(
+          StructuredTool.from_function(
                 func=self.ask_question,
                 name="Ask question to coworker",
                 description=self.i18n.tools("ask_question").format(coworkers=coworkers),
