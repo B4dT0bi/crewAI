@@ -3,39 +3,33 @@ from typing import TYPE_CHECKING, Optional
 
 from crewai.memory.entity.entity_memory_item import EntityMemoryItem
 from crewai.memory.long_term.long_term_memory_item import LongTermMemoryItem
+from crewai.utilities import I18N
 from crewai.utilities.converter import ConverterError
 from crewai.utilities.evaluators.task_evaluator import TaskEvaluator
-from crewai.utilities import I18N
-
+from crewai.utilities.printer import Printer
 
 if TYPE_CHECKING:
+    from crewai.agents.agent_builder.base_agent import BaseAgent
     from crewai.crew import Crew
     from crewai.task import Task
-    from crewai.agents.agent_builder.base_agent import BaseAgent
 
 
 class CrewAgentExecutorMixin:
     crew: Optional["Crew"]
-    crew_agent: Optional["BaseAgent"]
+    agent: Optional["BaseAgent"]
     task: Optional["Task"]
     iterations: int
-    force_answer_max_iterations: int
-    have_forced_answer: bool
+    max_iter: int
     _i18n: I18N
-
-    def _should_force_answer(self) -> bool:
-        """Determine if a forced answer is required based on iteration count."""
-        return (
-            self.iterations == self.force_answer_max_iterations
-        ) and not self.have_forced_answer
+    _printer: Printer = Printer()
 
     def _create_short_term_memory(self, output) -> None:
         """Create and save a short-term memory item if conditions are met."""
         if (
             self.crew
-            and self.crew_agent
+            and self.agent
             and self.task
-            and "Action: Delegate work to coworker" not in output.log
+            and "Action: Delegate work to coworker" not in output.text
         ):
             try:
                 if (
@@ -43,11 +37,11 @@ class CrewAgentExecutorMixin:
                     and self.crew._short_term_memory
                 ):
                     self.crew._short_term_memory.save(
-                        value=output.log,
+                        value=output.text,
                         metadata={
                             "observation": self.task.description,
                         },
-                        agent=self.crew_agent.role,
+                        agent=self.agent.role,
                     )
             except Exception as e:
                 print(f"Failed to add to short term memory: {e}")
@@ -61,18 +55,18 @@ class CrewAgentExecutorMixin:
             and self.crew._long_term_memory
             and self.crew._entity_memory
             and self.task
-            and self.crew_agent
+            and self.agent
         ):
             try:
-                ltm_agent = TaskEvaluator(self.crew_agent)
-                evaluation = ltm_agent.evaluate(self.task, output.log)
+                ltm_agent = TaskEvaluator(self.agent)
+                evaluation = ltm_agent.evaluate(self.task, output.text)
 
                 if isinstance(evaluation, ConverterError):
                     return
 
                 long_term_memory = LongTermMemoryItem(
                     task=self.task.description,
-                    agent=self.crew_agent.role,
+                    agent=self.agent.role,
                     quality=evaluation.quality,
                     datetime=str(time.time()),
                     expected_output=self.task.expected_output,
@@ -100,8 +94,30 @@ class CrewAgentExecutorMixin:
                 print(f"Failed to add to long term memory: {e}")
                 pass
 
-    def _ask_human_input(self, final_answer: dict) -> str:
-        """Prompt human input for final decision making."""
-        return input(
-            self._i18n.slice("getting_input").format(final_answer=final_answer)
+    def _ask_human_input(self, final_answer: str) -> str:
+        """Prompt human input with mode-appropriate messaging."""
+        self._printer.print(
+            content=f"\033[1m\033[95m ## Final Result:\033[00m \033[92m{final_answer}\033[00m"
         )
+
+        # Training mode prompt (single iteration)
+        if self.crew and getattr(self.crew, "_train", False):
+            prompt = (
+                "\n\n=====\n"
+                "## TRAINING MODE: Provide feedback to improve the agent's performance.\n"
+                "This will be used to train better versions of the agent.\n"
+                "Please provide detailed feedback about the result quality and reasoning process.\n"
+                "=====\n"
+            )
+        # Regular human-in-the-loop prompt (multiple iterations)
+        else:
+            prompt = (
+                "\n\n=====\n"
+                "## HUMAN FEEDBACK: Provide feedback on the Final Result and Agent's actions.\n"
+                "Respond with 'looks good' to accept or provide specific improvement requests.\n"
+                "You can provide multiple rounds of feedback until satisfied.\n"
+                "=====\n"
+            )
+
+        self._printer.print(content=prompt, color="bold_yellow")
+        return input()

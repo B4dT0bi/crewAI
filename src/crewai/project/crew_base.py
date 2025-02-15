@@ -1,15 +1,24 @@
 import inspect
+import logging
 from pathlib import Path
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, TypeVar, cast
 
 import yaml
 from dotenv import load_dotenv
 
 load_dotenv()
 
+logging.basicConfig(level=logging.WARNING)
 
-def CrewBase(cls):
-    class WrappedClass(cls):
+T = TypeVar("T", bound=type)
+
+"""Base decorator for creating crew classes with configuration and function management."""
+
+
+def CrewBase(cls: T) -> T:
+    """Wraps a class with crew functionality and configuration management."""
+
+    class WrappedClass(cls):  # type: ignore
         is_crew_class: bool = True  # type: ignore
 
         # Get the directory of the class being decorated
@@ -22,20 +31,83 @@ def CrewBase(cls):
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-
-            agents_config_path = self.base_directory / self.original_agents_config_path
-            tasks_config_path = self.base_directory / self.original_tasks_config_path
-
-            self.agents_config = self.load_yaml(agents_config_path)
-            self.tasks_config = self.load_yaml(tasks_config_path)
-
+            self.load_configurations()
             self.map_all_agent_variables()
             self.map_all_task_variables()
+            # Preserve all decorated functions
+            self._original_functions = {
+                name: method
+                for name, method in cls.__dict__.items()
+                if any(
+                    hasattr(method, attr)
+                    for attr in [
+                        "is_task",
+                        "is_agent",
+                        "is_before_kickoff",
+                        "is_after_kickoff",
+                        "is_kickoff",
+                    ]
+                )
+            }
+            # Store specific function types
+            self._original_tasks = self._filter_functions(
+                self._original_functions, "is_task"
+            )
+            self._original_agents = self._filter_functions(
+                self._original_functions, "is_agent"
+            )
+            self._before_kickoff = self._filter_functions(
+                self._original_functions, "is_before_kickoff"
+            )
+            self._after_kickoff = self._filter_functions(
+                self._original_functions, "is_after_kickoff"
+            )
+            self._kickoff = self._filter_functions(
+                self._original_functions, "is_kickoff"
+            )
+
+        def load_configurations(self):
+            """Load agent and task configurations from YAML files."""
+            if isinstance(self.original_agents_config_path, str):
+                agents_config_path = (
+                    self.base_directory / self.original_agents_config_path
+                )
+                try:
+                    self.agents_config = self.load_yaml(agents_config_path)
+                except FileNotFoundError:
+                    logging.warning(
+                        f"Agent config file not found at {agents_config_path}. "
+                        "Proceeding with empty agent configurations."
+                    )
+                    self.agents_config = {}
+            else:
+                logging.warning(
+                    "No agent configuration path provided. Proceeding with empty agent configurations."
+                )
+                self.agents_config = {}
+
+            if isinstance(self.original_tasks_config_path, str):
+                tasks_config_path = (
+                    self.base_directory / self.original_tasks_config_path
+                )
+                try:
+                    self.tasks_config = self.load_yaml(tasks_config_path)
+                except FileNotFoundError:
+                    logging.warning(
+                        f"Task config file not found at {tasks_config_path}. "
+                        "Proceeding with empty task configurations."
+                    )
+                    self.tasks_config = {}
+            else:
+                logging.warning(
+                    "No task configuration path provided. Proceeding with empty task configurations."
+                )
+                self.tasks_config = {}
 
         @staticmethod
         def load_yaml(config_path: Path):
             try:
-                with open(config_path, "r") as file:
+                with open(config_path, "r", encoding="utf-8") as file:
                     return yaml.safe_load(file)
             except FileNotFoundError:
                 print(f"File not found: {config_path}")
@@ -89,7 +161,10 @@ def CrewBase(cls):
             callbacks: Dict[str, Callable],
         ) -> None:
             if llm := agent_info.get("llm"):
-                self.agents_config[agent_name]["llm"] = llms[llm]()
+                try:
+                    self.agents_config[agent_name]["llm"] = llms[llm]()
+                except KeyError:
+                    self.agents_config[agent_name]["llm"] = llm
 
             if tools := agent_info.get("tools"):
                 self.agents_config[agent_name]["tools"] = [
@@ -175,4 +250,8 @@ def CrewBase(cls):
                     callback_functions[callback]() for callback in callbacks
                 ]
 
-    return WrappedClass
+    # Include base class (qual)name in the wrapper class (qual)name.
+    WrappedClass.__name__ = CrewBase.__name__ + "(" + cls.__name__ + ")"
+    WrappedClass.__qualname__ = CrewBase.__qualname__ + "(" + cls.__name__ + ")"
+
+    return cast(T, WrappedClass)

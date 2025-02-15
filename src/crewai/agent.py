@@ -1,45 +1,40 @@
-import os
-from inspect import signature
-from typing import Any, List, Optional, Tuple
+import re
+import shutil
+import subprocess
+from typing import Any, Dict, List, Literal, Optional, Sequence, Union
 
-from langchain.agents.agent import RunnableAgent
-from langchain.agents.tools import BaseTool
-from langchain.agents.tools import tool as LangChainTool
-from langchain_core.agents import AgentAction
-from langchain_core.callbacks import BaseCallbackHandler
-from langchain_openai import ChatOpenAI
 from pydantic import Field, InstanceOf, PrivateAttr, model_validator
 
-from crewai.agents import CacheHandler, CrewAgentExecutor, CrewAgentParser
+from crewai.agents import CacheHandler
 from crewai.agents.agent_builder.base_agent import BaseAgent
+from crewai.agents.crew_agent_executor import CrewAgentExecutor
+from crewai.knowledge.knowledge import Knowledge
+from crewai.knowledge.source.base_knowledge_source import BaseKnowledgeSource
+from crewai.knowledge.utils.knowledge_utils import extract_knowledge_context
+from crewai.llm import LLM
 from crewai.memory.contextual.contextual_memory import ContextualMemory
-from crewai.tools.agent_tools import AgentTools
+from crewai.task import Task
+from crewai.tools import BaseTool
+from crewai.tools.agent_tools.agent_tools import AgentTools
 from crewai.utilities import Converter, Prompts
 from crewai.utilities.constants import TRAINED_AGENTS_DATA_FILE, TRAINING_DATA_FILE
+from crewai.utilities.converter import generate_model_description
+from crewai.utilities.llm_utils import create_llm
 from crewai.utilities.token_counter_callback import TokenCalcHandler
 from crewai.utilities.training_handler import CrewTrainingHandler
 
+agentops = None
 
-def mock_agent_ops_provider():
-    def track_agent(*args, **kwargs):
+try:
+    import agentops  # type: ignore # Name "agentops" is already defined
+    from agentops import track_agent  # type: ignore
+except ImportError:
+
+    def track_agent():
         def noop(f):
             return f
 
         return noop
-
-    return track_agent
-
-
-agentops = None
-
-if os.environ.get("AGENTOPS_API_KEY"):
-    try:
-        import agentops  # type: ignore # Name "agentops" already defined on line 21
-        from agentops import track_agent
-    except ImportError:
-        track_agent = mock_agent_ops_provider()
-else:
-    track_agent = mock_agent_ops_provider()
 
 
 @track_agent()
@@ -54,17 +49,18 @@ class Agent(BaseAgent):
             role: The role of the agent.
             goal: The objective of the agent.
             backstory: The backstory of the agent.
+            knowledge: The knowledge base of the agent.
             config: Dict representation of agent configuration.
             llm: The language model that will run the agent.
             function_calling_llm: The language model that will handle the tool calling for this agent, it overrides the crew function_calling_llm.
             max_iter: Maximum number of iterations for an agent to execute a task.
-            memory: Whether the agent should have memory or not.
             max_rpm: Maximum number of requests per minute for the agent execution to be respected.
             verbose: Whether the agent execution should be in verbose mode.
             allow_delegation: Whether the agent is allowed to delegate tasks to other agents.
             tools: Tools at agents disposal
             step_callback: Callback to be executed after each step of the agent execution.
-            callbacks: A list of callback functions from the langchain library that are triggered during the agent's execution process
+            knowledge_sources: Knowledge sources for the agent.
+            embedder: Embedder configuration for the agent.
     """
 
     _times_executed: int = PrivateAttr(default=0)
@@ -74,24 +70,19 @@ class Agent(BaseAgent):
     )
     agent_ops_agent_name: str = None  # type: ignore # Incompatible types in assignment (expression has type "None", variable has type "str")
     agent_ops_agent_id: str = None  # type: ignore # Incompatible types in assignment (expression has type "None", variable has type "str")
-    cache_handler: InstanceOf[CacheHandler] = Field(
-        default=None, description="An instance of the CacheHandler class."
-    )
     step_callback: Optional[Any] = Field(
         default=None,
         description="Callback to be executed after each step of the agent execution.",
     )
-    llm: Any = Field(
-        default_factory=lambda: ChatOpenAI(
-            model=os.environ.get("OPENAI_MODEL_NAME", "gpt-4o")
-        ),
-        description="Language model that will run the agent.",
+    use_system_prompt: Optional[bool] = Field(
+        default=True,
+        description="Use system prompt for the agent.",
     )
-    function_calling_llm: Optional[Any] = Field(
+    llm: Union[str, InstanceOf[LLM], Any] = Field(
         description="Language model that will run the agent.", default=None
     )
-    callbacks: Optional[List[InstanceOf[BaseCallbackHandler]]] = Field(
-        default=None, description="Callback to be executed"
+    function_calling_llm: Optional[Union[str, InstanceOf[LLM], Any]] = Field(
+        description="Language model that will run the agent.", default=None
     )
     system_template: Optional[str] = Field(
         default=None, description="System format for the agent."
@@ -108,56 +99,71 @@ class Agent(BaseAgent):
     allow_code_execution: Optional[bool] = Field(
         default=False, description="Enable code execution for the agent."
     )
+    respect_context_window: bool = Field(
+        default=True,
+        description="Keep messages under the context window size by summarizing content.",
+    )
     max_retry_limit: int = Field(
         default=2,
         description="Maximum number of retries for an agent to execute a task when an error occurs.",
     )
+    multimodal: bool = Field(
+        default=False,
+        description="Whether the agent is multimodal.",
+    )
+    code_execution_mode: Literal["safe", "unsafe"] = Field(
+        default="safe",
+        description="Mode for code execution: 'safe' (using Docker) or 'unsafe' (direct execution).",
+    )
+    embedder: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Embedder configuration for the agent.",
+    )
 
     @model_validator(mode="after")
     def post_init_setup(self):
+        self._set_knowledge()
         self.agent_ops_agent_name = self.role
 
-        # Different llms store the model name in different attributes
-        model_name = getattr(self.llm, "model_name", None) or getattr(
-            self.llm, "deployment_name", None
-        )
-
-        if model_name:
-            self._setup_llm_callbacks(model_name)
+        self.llm = create_llm(self.llm)
+        if self.function_calling_llm and not isinstance(self.function_calling_llm, LLM):
+            self.function_calling_llm = create_llm(self.function_calling_llm)
 
         if not self.agent_executor:
             self._setup_agent_executor()
 
+        if self.allow_code_execution:
+            self._validate_docker_installation()
+
         return self
-
-    def _setup_llm_callbacks(self, model_name: str):
-        token_handler = TokenCalcHandler(model_name, self._token_process)
-
-        if not isinstance(self.llm.callbacks, list):
-            self.llm.callbacks = []
-
-        if not any(
-            isinstance(handler, TokenCalcHandler) for handler in self.llm.callbacks
-        ):
-            self.llm.callbacks.append(token_handler)
-
-        if agentops and not any(
-            isinstance(handler, agentops.LangchainCallbackHandler)
-            for handler in self.llm.callbacks
-        ):
-            agentops.stop_instrumenting()
-            self.llm.callbacks.append(agentops.LangchainCallbackHandler())
 
     def _setup_agent_executor(self):
         if not self.cache_handler:
             self.cache_handler = CacheHandler()
         self.set_cache_handler(self.cache_handler)
 
+    def _set_knowledge(self):
+        try:
+            if self.knowledge_sources:
+                full_pattern = re.compile(r"[^a-zA-Z0-9\-_\r\n]|(\.\.)")
+                knowledge_agent_name = f"{re.sub(full_pattern, '_', self.role)}"
+                if isinstance(self.knowledge_sources, list) and all(
+                    isinstance(k, BaseKnowledgeSource) for k in self.knowledge_sources
+                ):
+                    self.knowledge = Knowledge(
+                        sources=self.knowledge_sources,
+                        embedder=self.embedder,
+                        collection_name=knowledge_agent_name,
+                        storage=self.knowledge_storage or None,
+                    )
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Invalid Knowledge Configuration: {str(e)}")
+
     def execute_task(
         self,
-        task: Any,
+        task: Task,
         context: Optional[str] = None,
-        tools: Optional[List[Any]] = None,
+        tools: Optional[List[BaseTool]] = None,
     ) -> str:
         """Execute a task with the agent.
 
@@ -174,6 +180,24 @@ class Agent(BaseAgent):
 
         task_prompt = task.prompt()
 
+        # If the task requires output in JSON or Pydantic format,
+        # append specific instructions to the task prompt to ensure
+        # that the final answer does not include any code block markers
+        if task.output_json or task.output_pydantic:
+            # Generate the schema based on the output format
+            if task.output_json:
+                # schema = json.dumps(task.output_json, indent=2)
+                schema = generate_model_description(task.output_json)
+                task_prompt += "\n" + self.i18n.slice(
+                    "formatted_task_instructions"
+                ).format(output_format=schema)
+
+            elif task.output_pydantic:
+                schema = generate_model_description(task.output_pydantic)
+                task_prompt += "\n" + self.i18n.slice(
+                    "formatted_task_instructions"
+                ).format(output_format=schema)
+
         if context:
             task_prompt = self.i18n.slice("task_with_context").format(
                 task=task_prompt, context=context
@@ -181,24 +205,34 @@ class Agent(BaseAgent):
 
         if self.crew and self.crew.memory:
             contextual_memory = ContextualMemory(
+                self.crew.memory_config,
                 self.crew._short_term_memory,
                 self.crew._long_term_memory,
                 self.crew._entity_memory,
+                self.crew._user_memory,
             )
             memory = contextual_memory.build_context_for_task(task, context)
             if memory.strip() != "":
                 task_prompt += self.i18n.slice("memory").format(memory=memory)
 
-        tools = tools or self.tools or []
-        parsed_tools = self._parse_tools(tools)
-        self.create_agent_executor(tools=tools)
-        self.agent_executor.tools = parsed_tools
-        self.agent_executor.task = task
+        if self.knowledge:
+            agent_knowledge_snippets = self.knowledge.query([task.prompt()])
+            if agent_knowledge_snippets:
+                agent_knowledge_context = extract_knowledge_context(
+                    agent_knowledge_snippets
+                )
+                if agent_knowledge_context:
+                    task_prompt += agent_knowledge_context
 
-        self.agent_executor.tools_description = self._render_text_description_and_args(
-            parsed_tools
-        )
-        self.agent_executor.tools_names = self.__tools_names(parsed_tools)
+        if self.crew:
+            knowledge_snippets = self.crew.query_knowledge([task.prompt()])
+            if knowledge_snippets:
+                crew_knowledge_context = extract_knowledge_context(knowledge_snippets)
+                if crew_knowledge_context:
+                    task_prompt += crew_knowledge_context
+
+        tools = tools or self.tools or []
+        self.create_agent_executor(tools=tools, task=task)
 
         if self.crew and self.crew._train:
             task_prompt = self._training_handler(task_prompt=task_prompt)
@@ -211,9 +245,13 @@ class Agent(BaseAgent):
                     "input": task_prompt,
                     "tool_names": self.agent_executor.tools_names,
                     "tools": self.agent_executor.tools_description,
+                    "ask_for_human_input": task.human_input,
                 }
             )["output"]
         except Exception as e:
+            if e.__class__.__module__.startswith("litellm"):
+                # Do not retry on litellm errors
+                raise e
             self._times_executed += 1
             if self._times_executed > self.max_retry_limit:
                 raise e
@@ -231,72 +269,26 @@ class Agent(BaseAgent):
 
         return result
 
-    def format_log_to_str(
-        self,
-        intermediate_steps: List[Tuple[AgentAction, str]],
-        observation_prefix: str = "Observation: ",
-        llm_prefix: str = "",
-    ) -> str:
-        """Construct the scratchpad that lets the agent continue its thought process."""
-        thoughts = ""
-        for action, observation in intermediate_steps:
-            thoughts += action.log
-            thoughts += f"\n{observation_prefix}{observation}\n{llm_prefix}"
-        return thoughts
-
-    def create_agent_executor(self, tools=None) -> None:
+    def create_agent_executor(
+        self, tools: Optional[List[BaseTool]] = None, task=None
+    ) -> None:
         """Create an agent executor for the agent.
 
         Returns:
             An instance of the CrewAgentExecutor class.
         """
         tools = tools or self.tools or []
-
-        agent_args = {
-            "input": lambda x: x["input"],
-            "tools": lambda x: x["tools"],
-            "tool_names": lambda x: x["tool_names"],
-            "agent_scratchpad": lambda x: self.format_log_to_str(
-                x["intermediate_steps"]
-            ),
-        }
-
-        executor_args = {
-            "llm": self.llm,
-            "i18n": self.i18n,
-            "crew": self.crew,
-            "crew_agent": self,
-            "tools": self._parse_tools(tools),
-            "verbose": self.verbose,
-            "original_tools": tools,
-            "handle_parsing_errors": True,
-            "max_iterations": self.max_iter,
-            "max_execution_time": self.max_execution_time,
-            "step_callback": self.step_callback,
-            "tools_handler": self.tools_handler,
-            "function_calling_llm": self.function_calling_llm,
-            "callbacks": self.callbacks,
-            "max_tokens": self.max_tokens,
-        }
-
-        if self._rpm_controller:
-            executor_args["request_within_rpm_limit"] = (
-                self._rpm_controller.check_or_wait
-            )
+        parsed_tools = self._parse_tools(tools)
 
         prompt = Prompts(
-            i18n=self.i18n,
+            agent=self,
             tools=tools,
+            i18n=self.i18n,
+            use_system_prompt=self.use_system_prompt,
             system_template=self.system_template,
             prompt_template=self.prompt_template,
             response_template=self.response_template,
         ).task_execution()
-
-        execution_prompt = prompt.partial(
-            goal=self.goal,
-            role=self.role,
-            backstory=self.backstory,
-        )
 
         stop_words = [self.i18n.slice("observation")]
 
@@ -305,11 +297,26 @@ class Agent(BaseAgent):
                 self.response_template.split("{{ .Response }}")[1].strip()
             )
 
-        bind = self.llm.bind(stop=stop_words)
-
-        inner_agent = agent_args | execution_prompt | bind | CrewAgentParser(agent=self)
         self.agent_executor = CrewAgentExecutor(
-            agent=RunnableAgent(runnable=inner_agent), **executor_args
+            llm=self.llm,
+            task=task,
+            agent=self,
+            crew=self.crew,
+            tools=parsed_tools,
+            prompt=prompt,
+            original_tools=tools,
+            stop_words=stop_words,
+            max_iter=self.max_iter,
+            tools_handler=self.tools_handler,
+            tools_names=self.__tools_names(parsed_tools),
+            tools_description=self._render_text_description_and_args(parsed_tools),
+            step_callback=self.step_callback,
+            function_calling_llm=self.function_calling_llm,
+            respect_context_window=self.respect_context_window,
+            request_within_rpm_limit=(
+                self._rpm_controller.check_or_wait if self._rpm_controller else None
+            ),
+            callbacks=[TokenCalcHandler(self._token_process)],
         )
 
     def get_delegation_tools(self, agents: List[BaseAgent]):
@@ -317,11 +324,18 @@ class Agent(BaseAgent):
         tools = agent_tools.tools()
         return tools
 
+    def get_multimodal_tools(self) -> Sequence[BaseTool]:
+        from crewai.tools.agent_tools.add_image_tool import AddImageTool
+
+        return [AddImageTool()]
+
     def get_code_execution_tools(self):
         try:
-            from crewai_tools import CodeInterpreterTool
+            from crewai_tools import CodeInterpreterTool  # type: ignore
 
-            return [CodeInterpreterTool()]
+            # Set the unsafe_mode based on the code_execution_mode attribute
+            unsafe_mode = self.code_execution_mode == "unsafe"
+            return [CodeInterpreterTool(unsafe_mode=unsafe_mode)]
         except ModuleNotFoundError:
             self._logger.log(
                 "info", "Coding tools not available. Install crewai_tools. "
@@ -330,16 +344,16 @@ class Agent(BaseAgent):
     def get_output_converter(self, llm, text, model, instructions):
         return Converter(llm=llm, text=text, model=model, instructions=instructions)
 
-    def _parse_tools(self, tools: List[Any]) -> List[LangChainTool]:  # type: ignore # Function "langchain_core.tools.tool" is not valid as a type
+    def _parse_tools(self, tools: List[Any]) -> List[Any]:  # type: ignore
         """Parse tools to be used for the task."""
         tools_list = []
         try:
             # tentatively try to import from crewai_tools import BaseTool as CrewAITool
-            from crewai_tools import BaseTool as CrewAITool
+            from crewai.tools import BaseTool as CrewAITool
 
             for tool in tools:
                 if isinstance(tool, CrewAITool):
-                    tools_list.append(tool.to_langchain())
+                    tools_list.append(tool.to_structured_tool())
                 else:
                     tools_list.append(tool)
         except ModuleNotFoundError:
@@ -358,8 +372,9 @@ class Agent(BaseAgent):
                 human_feedbacks = [
                     i["human_feedback"] for i in data.get(agent_id, {}).values()
                 ]
-                task_prompt += "You MUST follow these feedbacks: \n " + "\n - ".join(
-                    human_feedbacks
+                task_prompt += (
+                    "\n\nYou MUST follow these instructions: \n "
+                    + "\n - ".join(human_feedbacks)
                 )
 
         return task_prompt
@@ -368,12 +383,13 @@ class Agent(BaseAgent):
         """Use trained data for the agent task prompt to improve output."""
         if data := CrewTrainingHandler(TRAINED_AGENTS_DATA_FILE).load():
             if trained_data_output := data.get(self.role):
-                task_prompt += "You MUST follow these feedbacks: \n " + "\n - ".join(
-                    trained_data_output["suggestions"]
+                task_prompt += (
+                    "\n\nYou MUST follow these instructions: \n - "
+                    + "\n - ".join(trained_data_output["suggestions"])
                 )
         return task_prompt
 
-    def _render_text_description(self, tools: List[BaseTool]) -> str:
+    def _render_text_description(self, tools: List[Any]) -> str:
         """Render the tool name and description in plain text.
 
         Output will be in the format of:
@@ -395,29 +411,38 @@ class Agent(BaseAgent):
     def _render_text_description_and_args(self, tools: List[BaseTool]) -> str:
         """Render the tool name, description, and args in plain text.
 
-        Output will be in the format of:
+            Output will be in the format of:
 
-        .. code-block:: markdown
+            .. code-block:: markdown
 
             search: This tool is used for search, args: {"query": {"type": "string"}}
             calculator: This tool is used for math, \
-    args: {"expression": {"type": "string"}}
+            args: {"expression": {"type": "string"}}
         """
         tool_strings = []
         for tool in tools:
-            args_schema = str(tool.args)
-            if hasattr(tool, "func") and tool.func:
-                sig = signature(tool.func)
-                description = (
-                    f"Tool Name: {tool.name}{sig}\nTool Description: {tool.description}"
-                )
-            else:
-                description = (
-                    f"Tool Name: {tool.name}\nTool Description: {tool.description}"
-                )
-            tool_strings.append(f"{description}\nTool Arguments: {args_schema}")
+            tool_strings.append(tool.description)
 
         return "\n".join(tool_strings)
+
+    def _validate_docker_installation(self) -> None:
+        """Check if Docker is installed and running."""
+        if not shutil.which("docker"):
+            raise RuntimeError(
+                f"Docker is not installed. Please install Docker to use code execution with agent: {self.role}"
+            )
+
+        try:
+            subprocess.run(
+                ["docker", "info"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except subprocess.CalledProcessError:
+            raise RuntimeError(
+                f"Docker is not running. Please start Docker to use code execution with agent: {self.role}"
+            )
 
     @staticmethod
     def __tools_names(tools) -> str:
