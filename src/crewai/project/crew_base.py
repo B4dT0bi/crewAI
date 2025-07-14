@@ -1,14 +1,13 @@
 import inspect
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, TypeVar, cast
+from typing import Any, Callable, Dict, TypeVar, cast, List
+from crewai.tools import BaseTool
 
 import yaml
 from dotenv import load_dotenv
 
 load_dotenv()
-
-logging.basicConfig(level=logging.WARNING)
 
 T = TypeVar("T", bound=type)
 
@@ -28,6 +27,8 @@ def CrewBase(cls: T) -> T:
             cls, "agents_config", "config/agents.yaml"
         )
         original_tasks_config_path = getattr(cls, "tasks_config", "config/tasks.yaml")
+
+        mcp_server_params: Any = getattr(cls, "mcp_server_params", None)
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
@@ -65,6 +66,38 @@ def CrewBase(cls: T) -> T:
             self._kickoff = self._filter_functions(
                 self._original_functions, "is_kickoff"
             )
+
+            # Add close mcp server method to after kickoff
+            bound_method = self._create_close_mcp_server_method()
+            self._after_kickoff['_close_mcp_server'] = bound_method
+
+        def _create_close_mcp_server_method(self):
+            def _close_mcp_server(self, instance, outputs):
+                adapter = getattr(self, '_mcp_server_adapter', None)
+                if adapter is not None:
+                    try:
+                        adapter.stop()
+                    except Exception as e:
+                        logging.warning(f"Error stopping MCP server: {e}")
+                return outputs
+
+            _close_mcp_server.is_after_kickoff = True
+
+            import types
+            return types.MethodType(_close_mcp_server, self)
+
+        def get_mcp_tools(self, *tool_names: list[str]) -> List[BaseTool]:
+            if not self.mcp_server_params:
+                return []
+
+            from crewai_tools import MCPServerAdapter
+
+            adapter = getattr(self, '_mcp_server_adapter', None)
+            if not adapter:
+                self._mcp_server_adapter = MCPServerAdapter(self.mcp_server_params)
+
+            return self._mcp_server_adapter.tools.filter_by_names(tool_names or None)
+
 
         def load_configurations(self):
             """Load agent and task configurations from YAML files."""
@@ -137,13 +170,11 @@ def CrewBase(cls: T) -> T:
                 all_functions, "is_cache_handler"
             )
             callbacks = self._filter_functions(all_functions, "is_callback")
-            agents = self._filter_functions(all_functions, "is_agent")
 
             for agent_name, agent_info in self.agents_config.items():
                 self._map_agent_variables(
                     agent_name,
                     agent_info,
-                    agents,
                     llms,
                     tool_functions,
                     cache_handler_functions,
@@ -154,7 +185,6 @@ def CrewBase(cls: T) -> T:
             self,
             agent_name: str,
             agent_info: Dict[str, Any],
-            agents: Dict[str, Callable],
             llms: Dict[str, Callable],
             tool_functions: Dict[str, Callable],
             cache_handler_functions: Dict[str, Callable],
@@ -172,9 +202,10 @@ def CrewBase(cls: T) -> T:
                 ]
 
             if function_calling_llm := agent_info.get("function_calling_llm"):
-                self.agents_config[agent_name]["function_calling_llm"] = agents[
-                    function_calling_llm
-                ]()
+                try:
+                    self.agents_config[agent_name]["function_calling_llm"] = llms[function_calling_llm]()
+                except KeyError:
+                    self.agents_config[agent_name]["function_calling_llm"] = function_calling_llm
 
             if step_callback := agent_info.get("step_callback"):
                 self.agents_config[agent_name]["step_callback"] = callbacks[
@@ -250,8 +281,12 @@ def CrewBase(cls: T) -> T:
                     callback_functions[callback]() for callback in callbacks
                 ]
 
+            if guardrail := task_info.get("guardrail"):
+                self.tasks_config[task_name]["guardrail"] = guardrail
+
     # Include base class (qual)name in the wrapper class (qual)name.
     WrappedClass.__name__ = CrewBase.__name__ + "(" + cls.__name__ + ")"
     WrappedClass.__qualname__ = CrewBase.__qualname__ + "(" + cls.__name__ + ")"
+    WrappedClass._crew_name = cls.__name__
 
     return cast(T, WrappedClass)
